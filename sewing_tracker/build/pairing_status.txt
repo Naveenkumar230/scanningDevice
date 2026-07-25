@@ -1,2 +1,0 @@
-paired=true
-machine_id=AIPL-98583-9043

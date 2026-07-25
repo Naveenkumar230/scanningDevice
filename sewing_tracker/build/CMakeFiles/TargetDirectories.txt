@@ -1,4 +1,0 @@
-/home/scanningdevice/sewing_tracker/build/CMakeFiles/station_scanner.dir
-/home/scanningdevice/sewing_tracker/build/CMakeFiles/focus_check.dir
-/home/scanningdevice/sewing_tracker/build/CMakeFiles/edit_cache.dir
-/home/scanningdevice/sewing_tracker/build/CMakeFiles/rebuild_cache.dir
