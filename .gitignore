@@ -1,3 +1,4 @@
 node_modules/
 sewing_tracker/build/
 sewing_tracker/node_modules/
+.env
