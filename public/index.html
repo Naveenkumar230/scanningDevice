@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Station Floor — Live Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-brand">
+    <span class="brand-mark" id="statusLight"></span>
+    <div class="brand-text">
+      <span class="brand-title">TraceGarment</span>
+      <span class="brand-sub">Live production dashboard</span>
+    </div>
+  </div>
+  <div class="topbar-meta">
+    <span id="connState" class="conn-pill conn-connecting">connecting…</span>
+    <span id="clock" class="clock"></span>
+    <!-- SETUP CORNER BUTTON -->
+    <button id="setupBtn" class="setup-btn" type="button" title="Machine setup" aria-label="Open machine setup">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+      <span id="setupBtnLabel">Setup</span>
+      <span id="setupDot" class="setup-dot"></span>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- SEARCH -->
+  <section class="search-panel">
+    <form id="searchForm" class="search-form" autocomplete="off">
+      <input
+        id="searchInput"
+        class="search-input"
+        type="text"
+        placeholder="Search operator code (BF11921) or fabric tag number (0004)…"
+        aria-label="Search operator or tag"
+      >
+      <button type="submit">Search</button>
+    </form>
+    <p class="search-hint">Operator codes open their detail page. Tag numbers show results here.</p>
+    <div id="searchResults" class="search-results hidden"></div>
+  </section>
+
+  <!-- STATS STRIP -->
+  <section class="stats-strip" id="statsStrip"></section>
+
+  <!-- ROSTER -->
+  <section class="panel roster-panel">
+    <div class="panel-header">
+      <h2>Operators</h2>
+      <span class="eyebrow">click an employee ID for full detail</span>
+    </div>
+    <div id="rosterBody" class="roster-body">
+      <p class="empty-msg">No sessions recorded yet.</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============================================================
+     SETUP OVERLAY (merged from setup.html)
+     Opened via the corner gear button. Same pairing/admin API
+     calls as before — nothing on the server side changes.
+     ============================================================ -->
+<div id="setupOverlay" class="setup-overlay hidden">
+  <div class="setup-scrim" id="setupScrim"></div>
+  <aside class="setup-panel">
+    <div class="setup-panel-head">
+      <h2>Machine Setup</h2>
+      <button id="setupCloseBtn" class="setup-close" type="button" aria-label="Close setup">✕</button>
+    </div>
+
+    <div class="setup-panel-body">
+      <section class="panel" style="box-shadow:none;">
+        <div class="panel-header">
+          <h2>Machine Pairing</h2>
+          <span class="eyebrow" id="statusEyebrow">checking…</span>
+        </div>
+        <div class="employee-body">
+          <div id="pairedView" class="hidden">
+            <p>This station is paired as <b id="machineIdDisplay" style="font-family:var(--mono);color:var(--amber);"></b>.</p>
+            <p class="search-hint">To scan a fabric tag or log an operator in/out, use the camera on the station itself — this panel is only for setup and admin.</p>
+          </div>
+
+          <div id="unpairedView" class="hidden">
+            <p class="search-hint">This station hasn't been paired yet. Either hold the printed MACHINE_SETUP QR code up to the station's camera, or enter the machine ID manually below.</p>
+            <form id="pairForm" class="search-form" style="flex-wrap:wrap;">
+              <input id="pairMachineId" class="search-input" type="text" placeholder="Machine ID (e.g. MACHINE-002)" style="flex:1 1 220px;">
+              <input id="pairPassword" class="search-input" type="password" placeholder="Set admin password" style="flex:1 1 220px;">
+              <button type="submit">Pair this station</button>
+            </form>
+            <p id="pairMsg" class="search-hint"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" style="box-shadow:none;">
+        <div class="panel-header">
+          <h2>Admin</h2>
+          <span class="eyebrow">requires the admin password set at pairing time</span>
+        </div>
+        <div class="employee-body">
+          <form id="adminForm" class="search-form" style="flex-wrap:wrap;">
+            <select id="adminAction" class="search-input" style="flex:1 1 200px;">
+              <option value="change_id">Change machine ID</option>
+              <option value="change_password">Change admin password</option>
+              <option value="delete_pairing">Delete pairing (forces re-setup)</option>
+            </select>
+            <input id="adminNewValue" class="search-input" type="text" placeholder="New value (ID or password)" style="flex:1 1 220px;">
+            <input id="adminPassword" class="search-input" type="password" placeholder="Current admin password" style="flex:1 1 220px;">
+            <button type="submit">Submit</button>
+          </form>
+          <p id="adminMsg" class="search-hint"></p>
+        </div>
+      </section>
+    </div>
+  </aside>
+</div>
+
+<script src="app.js"></script>
+<script src="setup.js"></script>
+</body>
+</html>

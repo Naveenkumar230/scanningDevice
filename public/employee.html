@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Employee Detail — Station Floor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-brand">
+    <a href="index.html" class="back-link">← Back to floor</a>
+  </div>
+  <div class="topbar-meta">
+    <span id="clock" class="clock"></span>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- TAG SEARCH -->
+  <section class="search-panel">
+    <form id="tagSearchForm" class="search-form" autocomplete="off">
+      <input
+        id="tagSearchInput"
+        class="search-input"
+        type="text"
+        placeholder="Search fabric tag number (e.g. 0004)…"
+        aria-label="Search tag"
+      >
+      <button type="submit">Search</button>
+    </form>
+    <p class="search-hint">Shows every time this tag was scanned, by whom, and whether it was accepted.</p>
+    <div id="tagSearchResults" class="search-results hidden"></div>
+  </section>
+
+  <section class="panel" id="employeePanel">
+    <div class="panel-header">
+      <h2 id="employeeTitle">Loading…</h2>
+    </div>
+    <div id="employeeBody" class="employee-body">
+      <p class="empty-msg">Loading employee details…</p>
+    </div>
+  </section>
+</main>
+
+<script src="employee.js"></script>
+</body>
+</html>
