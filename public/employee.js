@@ -36,6 +36,8 @@ function formatDuration(totalSeconds) {
 const params = new URLSearchParams(window.location.search);
 const code = (params.get("code") || "").trim();
 
+let lastRenderedJson = null;
+
 async function load() {
   if (!code) {
     employeeTitle.textContent = "No employee selected";
@@ -52,11 +54,17 @@ async function load() {
       return;
     }
     const data = await res.json();
+    const json = JSON.stringify(data);
+    if (json === lastRenderedJson) return; // nothing changed, skip re-render
+    lastRenderedJson = json;
     render(data);
   } catch (err) {
     employeeBody.innerHTML = `<p class="empty-msg">Could not load employee data — is the server running?</p>`;
   }
 }
+
+load();
+setInterval(load, 3000);
 
 function render(data) {
   const badge = data.isCurrentlyActive
@@ -126,8 +134,6 @@ function render(data) {
 
   employeeBody.innerHTML = summaryHtml + sessionsHtml;
 }
-
-load();
 
 // ================================================================
 // TAG SEARCH (same behavior as the home page search)
