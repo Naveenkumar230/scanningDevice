@@ -1,0 +1,10 @@
+cd ~/sewing_tracker/build
+make -j$(nproc)
+./station_scanner
+
+
+cd ~/sewing-dashboard
+node server.js -----> server run
+
+
+(cd ~/sewing_tracker/build && make -j$(nproc) station_scanner && ./station_scanner) & (cd ~/sewing-dashboard && node server.js)

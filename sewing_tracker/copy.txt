@@ -1,0 +1,677 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <regex>
+#include <unordered_map>
+#include <unordered_set>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cstring>
+#include <ctime>
+#include <opencv2/opencv.hpp>
+#include <zbar.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <unistd.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <pthread.h>
+
+using namespace std;
+using namespace cv;
+using namespace zbar;
+
+// Prints the raw QR payload once per accepted "tap" (i.e. right before it's
+// handed off to LOGIN/LOGOUT/TAG SCANNED/DUPLICATE IGNORED handling) --
+// NOT on every single frame the code is visible in. Leave this ON while
+// troubleshooting -- it tells you immediately what was decoded and what
+// happened with it, without flooding the terminal.
+const bool SCAN_DEBUG_MODE = true;
+
+// Prints the periodic "[PERF] Scan loop running at ~N scans/sec" line.
+// Turn this ON only when you actually need to check camera/loop speed --
+// it's just noise for normal day-to-day operation.
+const bool SHOW_PERF_STATS = false;
+
+// ================================================================
+// SECTION A: CAMERA + STREAMING -- UNTOUCHED, guarantees max camera speed
+// ================================================================
+
+mutex frameMutex;
+Mat latestFrame;
+atomic<bool> hasFrame(false);
+atomic<bool> running(true);
+
+mutex jpegMutex;
+vector<uchar> latestJpeg;
+
+// Scan zone, in full-frame (1456x1088) coordinates. Covers most of the
+// frame while leaving a small margin on each edge. Adjust these four
+// numbers directly if you need it bigger/smaller or shifted --
+// (x, y, width, height).
+const Rect SCAN_ROI(100, 60, 1250, 950);
+
+void captureThread(VideoCapture &cap) {
+    Mat frame;
+    while (running) {
+        if (!cap.read(frame)) {
+            continue;
+        }
+        lock_guard<mutex> lock(frameMutex);
+        latestFrame = frame;
+        hasFrame = true;
+    }
+}
+
+void previewEncodeThread() {
+    vector<int> jpegParams = { IMWRITE_JPEG_QUALITY, 40 };
+    while (running) {
+        Mat frameCopy;
+        {
+            lock_guard<mutex> lock(frameMutex);
+            if (!hasFrame) { continue; }
+            frameCopy = latestFrame;
+        }
+        // Draw the active scan zone on the frame BEFORE shrinking it, so it
+        // lines up with real coordinates. This shows up in the browser
+        // stream (http://<pi-ip>:8080) as a yellow box -- hold the QR code
+        // inside that box.
+        rectangle(frameCopy, SCAN_ROI, Scalar(0, 255, 255), 4);
+
+        Mat small;
+        resize(frameCopy, small, Size(320, 240));
+        vector<uchar> buf;
+        imencode(".jpg", small, buf, jpegParams);
+        {
+            lock_guard<mutex> lock(jpegMutex);
+            latestJpeg = buf;
+        }
+        this_thread::sleep_for(chrono::milliseconds(50));
+    }
+}
+
+void mjpegServerThread(int port) {
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) { cerr << "[STREAM ERROR] Could not create socket." << endl; return; }
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    if (bind(serverFd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        cerr << "[STREAM ERROR] Bind failed on port " << port << endl;
+        close(serverFd);
+        return;
+    }
+    listen(serverFd, 5);
+    cout << "[STREAM] MJPEG server listening on port " << port << " (view at http://<pi-ip>:" << port << "/stream)" << endl;
+    while (running) {
+        sockaddr_in clientAddr{};
+        socklen_t clientLen = sizeof(clientAddr);
+        int clientFd = accept(serverFd, (struct sockaddr*)&clientAddr, &clientLen);
+        if (clientFd < 0) continue;
+        int nodelay = 1;
+        setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n\r\n";
+        send(clientFd, header.c_str(), header.size(), 0);
+        while (running) {
+            vector<uchar> jpegCopy;
+            {
+                lock_guard<mutex> lock(jpegMutex);
+                if (latestJpeg.empty()) continue;
+                jpegCopy = latestJpeg;
+            }
+            string partHeader =
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                to_string(jpegCopy.size()) + "\r\n\r\n";
+            if (send(clientFd, partHeader.c_str(), partHeader.size(), MSG_NOSIGNAL) < 0) break;
+            if (send(clientFd, (const char*)jpegCopy.data(), jpegCopy.size(), MSG_NOSIGNAL) < 0) break;
+            if (send(clientFd, "\r\n", 2, MSG_NOSIGNAL) < 0) break;
+            this_thread::sleep_for(chrono::milliseconds(50));
+        }
+        close(clientFd);
+    }
+    close(serverFd);
+}
+
+// ================================================================
+// SECTION B: SESSION STATE
+// ================================================================
+
+const string LOG_FILE_PATH = "production_log.csv";
+const string MACHINE_ID = "MACHINE-001";   // fixed per device, never changes
+
+mutex sessionMutex;
+
+// One completed fabric tag scan, split into its parts.
+struct ScannedTag {
+    string fullRaw;      // exactly what was in the QR, untouched
+    string internalId;   // the hidden long number -- not printed on the tag
+    string labelNumber;  // the number that IS printed on the tag
+};
+
+struct SessionState {
+    bool active = false;
+    string operatorCode;
+    string sessionId;
+    chrono::system_clock::time_point loginTime;
+    string loginTimeStr;          // human-readable login timestamp
+    int pieceCount = 0;
+    vector<ScannedTag> scannedTags;   // every fabric tag scanned this session
+};
+SessionState session;
+
+// --------------------------------------------------------------
+// Duplicate-scan protection for FABRIC TAGS ONLY.
+//
+// Rule: once a fabric tag (matched on its full raw payload) has been
+// ACCEPTED as a real scan, that exact tag can never be counted again --
+// permanently, not just for a little while. One QR = one physical piece =
+// counted once. Any later read of the same tag is ignored and logged as a
+// duplicate, no matter how much time has passed.
+//
+// NOTE: this lock lives only in memory (alreadyScannedTags below), so it
+// resets if the program restarts. If a tag needs to stay locked out even
+// across restarts (e.g. so it can't be reused the next day), this would
+// need to also read prior SCAN rows from production_log.csv on startup --
+// ask if you want that added.
+//
+// This is independent of, and on top of, the existing per-frame presence
+// debounce -- that one still applies first so holding a tag steady
+// doesn't even get this far every frame.
+// --------------------------------------------------------------
+unordered_set<string> alreadyScannedTags;
+
+string currentTimestamp() {
+    auto now = chrono::system_clock::now();
+    time_t t = chrono::system_clock::to_time_t(now);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    return string(buf);
+}
+
+// Turns a raw seconds count into "Xh Ym Zs" (hours omitted if zero).
+string formatDuration(double totalSeconds) {
+    int wholeSeconds = static_cast<int>(totalSeconds);
+    int hours = wholeSeconds / 3600;
+    int minutes = (wholeSeconds % 3600) / 60;
+    int seconds = wholeSeconds % 60;
+
+    ostringstream oss;
+    if (hours > 0) oss << hours << "h ";
+    oss << minutes << "m " << seconds << "s";
+    return oss.str();
+}
+
+string makeSessionId(const string &operatorCode) {
+    return operatorCode + "_" + currentTimestamp();
+}
+
+// CSV-safe: strips commas/newlines out of a field so it can't corrupt a row.
+string sanitizeForCsv(const string &raw) {
+    string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (c == ',') out += ';';
+        else if (c == '\n' || c == '\r') out += ' ';
+        else out += c;
+    }
+    size_t start = out.find_first_not_of(" \t");
+    size_t end = out.find_last_not_of(" \t");
+    if (start == string::npos) return "";
+    return out.substr(start, end - start + 1);
+}
+
+// Fabric tags observed so far all follow the same pattern:
+//   <hidden internal id>,<printed label number>
+// e.g. "1964876122557996,0006" -- "0006" is what's actually printed on the
+// tag; the long number before the comma is NOT printed anywhere visible --
+// it's presumably an internal reference/serial from whatever system
+// generates these QR labels.
+//
+// Splitting only on the FIRST comma means this still works safely even if
+// a tag has no comma at all (the whole thing becomes internalId, and
+// labelNumber is just empty) -- e.g. "Aipl-26-27-0231.1" has no comma.
+ScannedTag parseTagPayload(const string &rawPayload) {
+    ScannedTag tag;
+    tag.fullRaw = rawPayload;
+
+    size_t commaPos = rawPayload.find(',');
+    if (commaPos == string::npos) {
+        tag.internalId = rawPayload;
+        tag.labelNumber = "";
+    } else {
+        tag.internalId = rawPayload.substr(0, commaPos);
+        tag.labelNumber = rawPayload.substr(commaPos + 1);
+    }
+    return tag;
+}
+
+// event_type: LOGIN / LOGOUT / LOGIN_CONFLICT / SCAN / UNATTRIBUTED_SCAN /
+//             DUPLICATE_IGNORED
+// For LOGIN/LOGOUT/LOGIN_CONFLICT rows, pass an empty ScannedTag{}.
+void writeLogRow(const string &eventType, const string &operatorCode,
+                  const string &sessionId, const ScannedTag &tag) {
+    bool fileExists = ifstream(LOG_FILE_PATH).good();
+    ofstream logFile(LOG_FILE_PATH, ios::app);
+    if (!logFile.is_open()) {
+        cerr << "[LOG ERROR] Could not open " << LOG_FILE_PATH << " for writing." << endl;
+        return;
+    }
+    if (!fileExists) {
+        logFile << "event_type,machine_id,operator_code,session_id,"
+                    "tag_full,tag_internal_id,tag_label_number,timestamp" << "\n";
+    }
+    logFile << eventType << "," << MACHINE_ID << "," << operatorCode << ","
+             << sessionId << ","
+             << sanitizeForCsv(tag.fullRaw) << ","
+             << sanitizeForCsv(tag.internalId) << ","
+             << sanitizeForCsv(tag.labelNumber) << ","
+             << currentTimestamp() << "\n";
+    logFile.close();
+}
+
+// Reconstructs a tag's raw QR payload from its already-split internal ID +
+// label number, exactly the way parseTagPayload() originally split it.
+// Used when replaying the CSV log to restore state.
+string reconstructTagFull(const string &internalId, const string &labelNumber) {
+    if (labelNumber.empty()) return internalId;
+    return internalId + "," + labelNumber;
+}
+
+// Parses "YYYY-MM-DD HH:MM:SS" back into a time_point, so a recovered
+// session's LOGOUT duration still calculates correctly even though the
+// program restarted in between.
+chrono::system_clock::time_point parseTimestampToTimePoint(const string &str) {
+    struct tm tmVal{};
+    strptime(str.c_str(), "%Y-%m-%d %H:%M:%S", &tmVal);
+    tmVal.tm_isdst = -1; // let mktime figure out DST rather than assuming
+    time_t t = mktime(&tmVal);
+    return chrono::system_clock::from_time_t(t);
+}
+
+// Splits a CSV line on commas. Safe here because every field written by
+// writeLogRow() already had its own internal commas replaced with
+// semicolons via sanitizeForCsv() -- so a plain comma-split always lines
+// up with the 8 real columns.
+vector<string> splitCsvLine(const string &line) {
+    vector<string> fields;
+    stringstream ss(line);
+    string field;
+    while (getline(ss, field, ',')) {
+        fields.push_back(field);
+    }
+    return fields;
+}
+
+// --------------------------------------------------------------
+// Runs once at startup, before the camera/threads start. Replays the
+// entire production_log.csv to answer two questions:
+//
+//  1. "Was an operator still logged in when this program last stopped?"
+//     If power, Wi-Fi, or the process itself drops mid-shift, we don't
+//     want to force a re-login and lose their piece count -- every
+//     LOGIN/SCAN/LOGOUT is already in the CSV as it happens, so we can
+//     reconstruct exactly where things stood: find the most recent LOGIN
+//     that never got a matching LOGOUT, and restore that session into
+//     memory. The operator does NOT need to scan their card again --
+//     only scanning it once, to log out, is needed.
+//
+//  2. "Which fabric tags have ALREADY been scanned, ever?" A tag is
+//     locked out permanently the moment it's accepted (one QR = one
+//     physical piece = counted once). That lock has to survive a
+//     restart too, or a power cut would silently let every previously
+//     scanned tag be double-counted again. So every accepted SCAN row
+//     in the whole file -- not just the recovered session -- gets
+//     re-added to the lock set.
+// --------------------------------------------------------------
+void recoverSessionFromLog() {
+    ifstream logFile(LOG_FILE_PATH);
+    if (!logFile.is_open()) {
+        return; // no log yet -- nothing to recover, fresh start
+    }
+
+    string candidateSessionId, candidateOperator, candidateLoginTimeStr;
+    vector<ScannedTag> candidateTags;
+    int candidatePieceCount = 0;
+    int totalTagsRelocked = 0;
+
+    string line;
+    bool first = true;
+    while (getline(logFile, line)) {
+        if (first) {
+            first = false;
+            if (line.rfind("event_type,", 0) == 0) continue; // header row
+        }
+        if (line.empty()) continue;
+
+        vector<string> f = splitCsvLine(line);
+        if (f.size() < 8) continue; // malformed/partial row (e.g. power cut mid-write) -- skip
+
+        const string &eventType = f[0];
+        const string &operatorCode = f[2];
+        const string &sessionId = f[3];
+        const string &tagInternalId = f[5];
+        const string &tagLabelNumber = f[6];
+        const string &timestamp = f[7];
+
+        if (eventType == "LOGIN") {
+            candidateSessionId = sessionId;
+            candidateOperator = operatorCode;
+            candidateLoginTimeStr = timestamp;
+            candidateTags.clear();
+            candidatePieceCount = 0;
+        } else if (eventType == "LOGOUT" && sessionId == candidateSessionId) {
+            candidateSessionId.clear();
+            candidateOperator.clear();
+        } else if (eventType == "SCAN") {
+            // Every accepted scan, from any session ever, re-locks that
+            // exact tag so it can't be double-counted after a restart.
+            string fullRaw = reconstructTagFull(tagInternalId, tagLabelNumber);
+            alreadyScannedTags.insert(fullRaw);
+            totalTagsRelocked++;
+
+            // If it also belongs to the in-progress candidate session,
+            // it needs to show up in that session's restored tag list.
+            if (!candidateSessionId.empty() && sessionId == candidateSessionId) {
+                ScannedTag tag;
+                tag.internalId = tagInternalId;
+                tag.labelNumber = tagLabelNumber;
+                tag.fullRaw = fullRaw;
+                candidateTags.push_back(tag);
+                candidatePieceCount++;
+            }
+        }
+    }
+    logFile.close();
+
+    if (totalTagsRelocked > 0) {
+        cout << "[INFO] Re-locked " << totalTagsRelocked
+             << " previously scanned tag(s) from log history -- they cannot be counted again." << endl;
+    }
+
+    if (candidateSessionId.empty()) {
+        return; // nobody was left logged in -- normal fresh start
+    }
+
+    session.active = true;
+    session.operatorCode = candidateOperator;
+    session.sessionId = candidateSessionId;
+    session.loginTimeStr = candidateLoginTimeStr;
+    session.loginTime = parseTimestampToTimePoint(candidateLoginTimeStr);
+    session.pieceCount = candidatePieceCount;
+    session.scannedTags = candidateTags;
+
+    cout << "\n=========================================" << endl;
+    cout << "[SESSION RESTORED] Recovered an in-progress session after restart." << endl;
+    cout << "Operator         : " << session.operatorCode << endl;
+    cout << "Session ID       : " << session.sessionId << endl;
+    cout << "Login Time       : " << session.loginTimeStr << endl;
+    cout << "Pieces so far    : " << session.pieceCount << endl;
+    cout << "This operator does NOT need to log in again -- scan your QR" << endl;
+    cout << "only when you are ready to log OUT." << endl;
+    cout << "=========================================" << endl;
+}
+
+void handleOperatorEvent(const string &empCode) {
+    lock_guard<mutex> lock(sessionMutex);
+
+    if (!session.active) {
+        session.active = true;
+        session.operatorCode = empCode;
+        session.sessionId = makeSessionId(empCode);
+        session.loginTime = chrono::system_clock::now();
+        session.loginTimeStr = currentTimestamp();
+        session.pieceCount = 0;
+        session.scannedTags.clear();
+
+        cout << "\n=========================================" << endl;
+        cout << "[LOGIN] Operator " << empCode << " is now ACTIVE." << endl;
+        cout << "Session ID : " << session.sessionId << endl;
+        cout << "Login Time : " << session.loginTimeStr << endl;
+        cout << "=========================================" << endl;
+
+        writeLogRow("LOGIN", empCode, session.sessionId, ScannedTag{});
+    }
+    else if (session.active && empCode == session.operatorCode) {
+        auto now = chrono::system_clock::now();
+        chrono::duration<double> workedSeconds = now - session.loginTime;
+        string logoutTimeStr = currentTimestamp();
+
+        cout << "\n=========================================" << endl;
+        cout << "[LOGOUT] Operator " << empCode << " session ended." << endl;
+        cout << "Session ID       : " << session.sessionId << endl;
+        cout << "Login Time       : " << session.loginTimeStr << endl;
+        cout << "Logout Time      : " << logoutTimeStr << endl;
+        cout << "Duration         : " << formatDuration(workedSeconds.count()) << endl;
+        cout << "Pieces completed : " << session.pieceCount << endl;
+        if (session.scannedTags.empty()) {
+            cout << "Tags scanned     : (none)" << endl;
+        } else {
+            cout << "Tags scanned     :" << endl;
+            for (size_t i = 0; i < session.scannedTags.size(); i++) {
+                const ScannedTag &t = session.scannedTags[i];
+                cout << "  " << (i + 1) << ". Label #: "
+                     << (t.labelNumber.empty() ? "(none)" : t.labelNumber)
+                     << "   |  Internal ID: " << t.internalId
+                     << "   |  Full raw: " << t.fullRaw << endl;
+            }
+        }
+        cout << "=========================================" << endl;
+
+        writeLogRow("LOGOUT", empCode, session.sessionId, ScannedTag{});
+
+        session.active = false;
+        session.operatorCode.clear();
+        session.sessionId.clear();
+        session.loginTimeStr.clear();
+        session.pieceCount = 0;
+        session.scannedTags.clear();
+    }
+    else {
+        cout << "\n[WARNING] A different operator card (" << empCode << ") was read, but "
+             << session.operatorCode << " is already logged in on this station." << endl;
+        cout << "Ask the current operator to log out first (scan their own QR)." << endl;
+
+        writeLogRow("LOGIN_CONFLICT", empCode, session.sessionId, ScannedTag{});
+    }
+}
+
+// rawPayload is the RAW, unparsed content of the fabric QR code. It gets
+// split into internalId / labelNumber here (see parseTagPayload above),
+// and all three forms (full/internal/label) are shown and logged.
+void handleTagEvent(const string &rawPayload) {
+    ScannedTag tag = parseTagPayload(rawPayload);
+
+    lock_guard<mutex> lock(sessionMutex);
+
+    // ---- Duplicate check (permanent, once-only per tag) ----
+    if (alreadyScannedTags.count(rawPayload) > 0) {
+        cout << "\n[DUPLICATE IGNORED] Tag " << tag.fullRaw
+             << " (Label #: " << (tag.labelNumber.empty() ? "(none)" : tag.labelNumber) << ")"
+             << " was already scanned earlier and cannot be counted again -- ignored." << endl;
+
+        string opForLog = session.active ? session.operatorCode : "";
+        string sessForLog = session.active ? session.sessionId : "";
+        writeLogRow("DUPLICATE_IGNORED", opForLog, sessForLog, tag);
+        return; // do NOT count, do NOT add to session list, do NOT unlock it
+    }
+
+    // Accepted as a genuine new scan -- lock this exact tag out permanently.
+    alreadyScannedTags.insert(rawPayload);
+
+    if (session.active) {
+        session.pieceCount++;
+        session.scannedTags.push_back(tag);
+        cout << "\n[TAG SCANNED] Label #: " << (tag.labelNumber.empty() ? "(none)" : tag.labelNumber)
+             << "  |  Internal ID: " << tag.internalId
+             << "  |  Full raw: " << tag.fullRaw
+             << "  |  Operator: " << session.operatorCode
+             << "  |  Pieces this session: " << session.pieceCount << endl;
+        writeLogRow("SCAN", session.operatorCode, session.sessionId, tag);
+    } else {
+        cout << "\n[UNATTRIBUTED SCAN] Tag " << tag.fullRaw
+             << " was scanned but no operator is logged in on this station!" << endl;
+        writeLogRow("UNATTRIBUTED_SCAN", "", "", tag);
+    }
+}
+
+// ================================================================
+// MAIN
+// ================================================================
+
+int main() {
+    ImageScanner scanner;
+    // Only decode QR codes -- you never use other symbologies (Code128,
+    // DataBar, EAN, etc), and leaving them enabled wastes CPU on every
+    // frame and throws "databar" decode assertion warnings in the log.
+    scanner.set_config(ZBAR_NONE, ZBAR_CFG_ENABLE, 0);
+    scanner.set_config(ZBAR_QRCODE, ZBAR_CFG_ENABLE, 1);
+
+    // Operator QR codes are always in the form BF##### (2 letters "BF" + 5 digits).
+    // Anything scanned that does NOT match this is treated as a fabric tag.
+    regex operatorCodeRegex(R"(^BF[0-9]{5}$)", regex::icase);
+
+    string pipeline = "libcamerasrc ! video/x-raw, width=1456, height=1088, format=NV12, framerate=60/1 ! "
+                      "videoconvert ! video/x-raw, format=BGR ! "
+                      "appsink drop=true max-buffers=1";
+
+    VideoCapture cap(pipeline, CAP_GSTREAMER);
+    if (!cap.isOpened()) {
+        cerr << "[ERROR] Critical: Could not interface with the Arducam IMX296 global shutter sensor via GStreamer." << endl;
+        return -1;
+    }
+
+    cout << "[SUCCESS] Station active. Camera pipeline established at 60 FPS." << endl;
+    cout << "[INFO] Machine ID: " << MACHINE_ID << endl;
+    cout << "[INFO] Raw scan debug output: " << (SCAN_DEBUG_MODE ? "ON" : "OFF") << endl;
+    cout << "[INFO] Perf stats output: " << (SHOW_PERF_STATS ? "ON" : "OFF") << endl;
+    cout << "[INFO] Fabric tag duplicate protection: each tag counted once only (permanent, resets on restart)" << endl;
+    cout << "[INFO] Scan your own operator QR code to log in/out." << endl;
+    cout << "[INFO] Scan a fabric tag QR normally for production scans." << endl;
+
+    thread camThread(captureThread, ref(cap));
+    thread previewThread(previewEncodeThread);
+    thread streamThread(mjpegServerThread, 8080);
+
+    cpu_set_t coreSet;
+    CPU_ZERO(&coreSet);
+    CPU_SET(0, &coreSet);
+    pthread_setaffinity_np(camThread.native_handle(), sizeof(cpu_set_t), &coreSet);
+
+    CPU_ZERO(&coreSet);
+    CPU_SET(1, &coreSet);
+    pthread_setaffinity_np(previewThread.native_handle(), sizeof(cpu_set_t), &coreSet);
+
+    CPU_ZERO(&coreSet);
+    CPU_SET(2, &coreSet);
+    pthread_setaffinity_np(streamThread.native_handle(), sizeof(cpu_set_t), &coreSet);
+
+    camThread.detach();
+    previewThread.detach();
+    streamThread.detach();
+
+    while (!hasFrame) {
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+
+    Mat frame, croppedFrame, grayFrame;
+    int frameCount = 0;
+    auto fpsTimer = chrono::high_resolution_clock::now();
+
+    // Tracks, per QR payload, the last frame it was seen in -- NOT the last
+    // time it triggered an event. A code only counts as a "new tap" once it
+    // has been missing from view for PRESENCE_GAP_SECONDS and then reappears
+    // (or is seen for the very first time). This is what stops a card/tag
+    // that's simply being held steady in front of the camera from
+    // re-triggering LOGIN/LOGOUT or a re-count every second or two.
+    //
+    // NOTE: this is separate from the permanent once-only tag lock above.
+    // This only prevents re-triggering while a tag never leaves view;
+    // the lock above prevents that same tag from ever being counted
+    // again at all, even after it leaves view and comes back.
+    unordered_map<string, chrono::steady_clock::time_point> lastSeenAt;
+    const double PRESENCE_GAP_SECONDS = 2.5;
+
+    while (true) {
+        {
+            lock_guard<mutex> lock(frameMutex);
+            frame = latestFrame;
+        }
+
+        croppedFrame = frame(SCAN_ROI);
+        cvtColor(croppedFrame, grayFrame, COLOR_BGR2GRAY);
+
+        int width = grayFrame.cols;
+        int height = grayFrame.rows;
+        uchar *raw = grayFrame.data;
+
+        Image zbarImage(width, height, "Y800", raw, width * height);
+        int scanResult = scanner.scan(zbarImage);
+
+        if (scanResult > 0) {
+            for (Image::SymbolIterator symbol = zbarImage.symbol_begin(); symbol != zbarImage.symbol_end(); ++symbol) {
+                string payload = symbol->get_data();
+
+                auto now = chrono::steady_clock::now();
+
+                auto it = lastSeenAt.find(payload);
+                bool isNewTap;
+                if (it == lastSeenAt.end()) {
+                    isNewTap = true; // never seen this code before
+                } else {
+                    chrono::duration<double> gap = now - it->second;
+                    isNewTap = gap.count() >= PRESENCE_GAP_SECONDS;
+                }
+                lastSeenAt[payload] = now; // always refresh "last seen", every frame
+
+                if (!isNewTap) {
+                    continue; // still the same card/tag sitting in view -- ignore
+                }
+
+                // Only print the debug line for taps that actually get
+                // processed -- one line per real attempt, not per frame.
+                if (SCAN_DEBUG_MODE) {
+                    cout << "[QR DEBUG] Decoded: '" << payload << "' (length=" << payload.size() << ")" << endl;
+                }
+
+                if (regex_match(payload, operatorCodeRegex)) {
+                    // Operator login/logout.
+                    handleOperatorEvent(payload);
+                } else {
+                    // Fabric tag -- split into internal ID + label number,
+                    // check the 2-minute duplicate lockout, and log both.
+                    handleTagEvent(payload);
+                }
+            }
+        }
+
+        zbarImage.set_data(NULL, 0);
+
+        frameCount++;
+        auto now = chrono::high_resolution_clock::now();
+        chrono::duration<double> sinceLastPrint = now - fpsTimer;
+        if (sinceLastPrint.count() >= 1.0) {
+            if (SHOW_PERF_STATS) {
+                cout << "[PERF] Scan loop running at ~" << frameCount << " scans/sec" << endl;
+            }
+            frameCount = 0;
+            fpsTimer = now;
+        }
+    }
+
+    running = false;
+    cap.release();
+    return 0;
+}
